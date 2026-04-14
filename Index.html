@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TempVault – Disposable Email</title>
+  <meta name="description" content="Free, instant, disposable temp email. No signup required." />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>" />
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.25.6/babel.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { min-height: 100vh; background: #0d1a14; }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(99,211,168,0.2); border-radius: 2px; }
+    @keyframes spin   { to { transform: rotate(360deg); } }
+    @keyframes fadeUp { from { opacity:0; transform: translateX(-50%) translateY(10px); } to { opacity:1; transform: translateX(-50%) translateY(0); } }
+    @keyframes pulse  { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+    .btn-hover:hover  { opacity: 0.85; transform: translateY(-1px); }
+    .btn-hover:active { transform: translateY(0); }
+    .msg-row:hover    { background: rgba(255,255,255,0.03) !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    /* =========================================================
+       CORS-resilient API layer
+       Strategy chain tried in order until one succeeds:
+         0: api.mail.tm  direct
+         1: api.mail.gw  direct
+         2: api.mail.tm  via corsproxy.io
+         3: api.mail.gw  via corsproxy.io
+         4: api.mail.tm  via allorigins
+         5: api.mail.gw  via allorigins
+       Winning strategy is cached for the session.
+    ========================================================= */
+    const BASES = ["https://api.mail.tm", "https://api.mail.gw"];
+    const PROXIES = [
+      (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+      (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    ];
+
+    // Build strategy list: each item wraps a path into a full fetch URL
+    const STRATEGIES = [
+      ...BASES.map(b => (path) => `${b}${path}`),
+      ...PROXIES.flatMap(px => BASES.map(b => (path) => px(`${b}${path}`))),
+    ];
+
+    let _si = null; // cached winning strategy index
+
+    async function probe() {
+      if (_si !== null) return _si;
+      for (let i = 0; i < STRATEGIES.length; i++) {
+        try {
+          const url = STRATEGIES[i]("/domains?page=1");
+          const ctl = new AbortController();
+          const tid = setTimeout(() => ctl.abort(), 7000);
+          const r   = await fetch(url, { signal: ctl.signal });
+          clearTimeout(tid);
+          if (r.ok) {
+            const d = await r.json();
+            if (Array.isArray(d["hydra:member"])) { _si = i; return i; }
+          }
+        } catch (_) { /* try next */ }
+      }
+      throw new Error("Cannot reach any mail API. Check your internet connection, then tap again.");
+    }
+
+    async function req(path, opts = {}) {
+      const si  = await probe();
+      const url = STRATEGIES[si](path);
+      const ctl = new AbortController();
+      const tid = setTimeout(() => ctl.abort(), 14000);
+      const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+      const r = await fetch(url, { ...opts, headers, signal: ctl.signal });
+      clearTimeout(tid);
+      return r;
+    }
+
+    const api = {
+      async getDomains() {
+        const r = await req("/domains?page=1");
+        if (!r.ok) throw new Error("Failed to fetch domains");
+        return (await r.json())["hydra:member"];
+      },
+      async createAccount(address, password) {
+        const r = await req("/accounts", { method: "POST", body: JSON.stringify({ address, password }) });
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          throw new Error(e["hydra:description"] || "Failed to create account");
+        }
+        return r.json();
+      },
+      async getToken(address, password) {
+        const r = await req("/token", { method: "POST", body: JSON.stringify({ address, password }) });
+        if (!r.ok) throw new Error("Authentication failed — please generate a new inbox");
+        return r.json();
+      },
+      async getMessages(token) {
+        const r = await req("/messages?page=1", { headers: { Authorization: `Bearer ${token}` } });
+        if (!r.ok) throw new Error("Failed to fetch messages");
+        return (await r.json())["hydra:member"];
+      },
+      async getMessage(token, id) {
+        const r = await req(`/messages/${id}`, { headers: { Authorization: `Bearer ${token}` } });
+        if (!r.ok) throw new Error("Failed to load message");
+        return r.json();
+      },
+      async deleteMessage(token, id) {
+        await req(`/messages/${id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
+      },
+    };
+
+    /* ========= Utilities ========= */
+    const rand        = (n = 10) => Math.random().toString(36).slice(2, 2 + n);
+    const LS_KEY      = "tmpmail_v4";
+    const saveSession  = (d) => localStorage.setItem(LS_KEY, JSON.stringify(d));
+    const loadSession  = () => { try { return JSON.parse(localStorage.getItem(LS_KEY)); } catch { return null; } };
+    const clearSession = () => localStorage.removeItem(LS_KEY);
+    const fmtDate = (iso) => {
+      const d = new Date(iso), s = (new Date() - d) / 1000;
+      if (s < 60)    return "just now";
+      if (s < 3600)  return `${Math.floor(s/60)}m ago`;
+      if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+      return d.toLocaleDateString();
+    };
+
+    /* ========= Icon ========= */
+    function Icon({ name, size = 18, style = {} }) {
+      const d = {
+        mail:    <><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></>,
+        refresh: <><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></>,
+        copy:    <><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></>,
+        check:   <polyline points="20 6 9 17 4 12"/>,
+        trash:   <><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></>,
+        back:    <path d="m15 18-6-6 6-6"/>,
+        plus:    <><path d="M5 12h14"/><path d="M12 5v14"/></>,
+        inbox:   <><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></>,
+        zap:     <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>,
+        shield:  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>,
+        eye:     <><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></>,
+        x:       <><path d="M18 6 6 18"/><path d="m6 6 12 12"/></>,
+        clock:   <><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></>,
+        star:    <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>,
+      };
+      return (
+        <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24"
+          fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={style}>
+          {d[name]}
+        </svg>
+      );
+    }
+
+    function Spinner({ size = 20 }) {
+      return <div style={{ width: size, height: size, border: `2px solid rgba(99,211,168,0.15)`, borderTop: `2px solid #63d3a8`, borderRadius: "50%", animation: "spin 0.7s linear infinite", display: "inline-block", flexShrink: 0 }} />;
+    }
+
+    function Toast({ msg, onDone }) {
+      useEffect(() => { const t = setTimeout(onDone, 2800); return () => clearTimeout(t); }, [onDone]);
+      return <div style={{ position: "fixed", bottom: 28, left: "50%", transform: "translateX(-50%)", background: "#1a2e25", border: "1px solid #63d3a8", color: "#63d3a8", padding: "10px 22px", borderRadius: 40, fontSize: 13, fontWeight: 600, zIndex: 9999, boxShadow: "0 8px 32px rgba(0,0,0,0.5)", animation: "fadeUp 0.3s ease", whiteSpace: "nowrap" }}>{msg}</div>;
+    }
+
+    function MessageRow({ msg, selected, onClick }) {
+      const u = !msg.seen;
+      return (
+        <div className="msg-row" onClick={onClick} style={{ padding: "14px 18px", cursor: "pointer", borderBottom: "1px solid rgba(255,255,255,0.05)", background: selected ? "rgba(99,211,168,0.1)" : u ? "rgba(99,211,168,0.04)" : "transparent", borderLeft: selected ? "3px solid #63d3a8" : u ? "3px solid rgba(99,211,168,0.35)" : "3px solid transparent", transition: "background 0.15s" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 4 }}>
+            <span style={{ fontWeight: u ? 700 : 500, color: u ? "#e2f0eb" : "#6b8a7f", fontSize: 13, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "62%" }}>
+              {msg.from?.name || msg.from?.address || "Unknown"}
+            </span>
+            <span style={{ fontSize: 11, color: "#3a5a50", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 3 }}>
+              <Icon name="clock" size={10} style={{ color: "#3a5a50" }} />{fmtDate(msg.createdAt)}
+            </span>
+          </div>
+          <div style={{ fontWeight: u ? 600 : 400, color: u ? "#c8e6da" : "#506860", fontSize: 13, marginBottom: 3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{msg.subject || "(no subject)"}</div>
+          <div style={{ color: "#3a5a50", fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{msg.intro || ""}</div>
+        </div>
+      );
+    }
+
+    function MessageView({ token, msgId, onBack, onDelete }) {
+      const [msg, setMsg]  = useState(null);
+      const [load, setLd]  = useState(true);
+      const [err, setErr]  = useState(null);
+
+      useEffect(() => {
+        setLd(true); setErr(null); setMsg(null);
+        api.getMessage(token, msgId).then(setMsg).catch(e => setErr(e.message)).finally(() => setLd(false));
+      }, [token, msgId]);
+
+      const del = async () => {
+        if (!window.confirm("Delete this message?")) return;
+        await api.deleteMessage(token, msgId); onDelete();
+      };
+
+      if (load) return <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 12, color: "#3a5a50" }}><Spinner size={28} /><span style={{ fontSize: 13 }}>Loading…</span></div>;
+      if (err)  return <div style={{ padding: 32, color: "#e27a7a", textAlign: "center" }}><Icon name="x" size={28} style={{ color: "#e27a7a" }} /><br />{err}</div>;
+
+      return (
+        <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+          <div style={{ padding: "14px 18px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+            <button onClick={onBack} className="btn-hover" style={{ background: "rgba(255,255,255,0.06)", border: "none", color: "#8fada3", padding: "7px 12px", borderRadius: 8, cursor: "pointer", display: "flex", alignItems: "center", gap: 5, fontSize: 13, fontFamily: "inherit", fontWeight: 600, transition: "all 0.15s" }}>
+              <Icon name="back" size={14} style={{ color: "#8fada3" }} /> Back
+            </button>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 700, color: "#e2f0eb", fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{msg?.subject || "(no subject)"}</div>
+              <div style={{ fontSize: 11, color: "#3a5a50" }}>From: {msg?.from?.name ? `${msg.from.name} <${msg.from.address}>` : msg?.from?.address}</div>
+            </div>
+            <button onClick={del} className="btn-hover" style={{ background: "rgba(226,122,122,0.08)", border: "1px solid rgba(226,122,122,0.18)", color: "#e27a7a", padding: "7px 10px", borderRadius: 8, cursor: "pointer", display: "flex", alignItems: "center", gap: 4, fontSize: 12, fontFamily: "inherit", fontWeight: 600, transition: "all 0.15s", flexShrink: 0 }}>
+              <Icon name="trash" size={13} style={{ color: "#e27a7a" }} /> Delete
+            </button>
+          </div>
+          <div style={{ padding: "8px 18px", borderBottom: "1px solid rgba(255,255,255,0.04)", display: "flex", flexWrap: "wrap", gap: "4px 16px", flexShrink: 0 }}>
+            <span style={{ fontSize: 11, color: "#3a5a50" }}>{new Date(msg?.createdAt).toLocaleString()}</span>
+            <span style={{ fontSize: 11, color: "#3a5a50" }}>To: {msg?.to?.map(t => t.address).join(", ")}</span>
+            {msg?.attachments?.length > 0 && <span style={{ fontSize: 11, color: "#e2b87a" }}>📎 {msg.attachments.length} attachment(s)</span>}
+          </div>
+          <div style={{ flex: 1, overflow: "auto", padding: msg?.html?.[0] ? 0 : 20 }}>
+            {msg?.html?.[0]
+              ? <iframe srcDoc={msg.html[0]} style={{ width: "100%", height: "100%", minHeight: 360, border: "none", background: "#fff", display: "block" }} sandbox="allow-same-origin" title="email-body" />
+              : <pre style={{ color: "#c8e6da", fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", fontFamily: "'JetBrains Mono', monospace" }}>{msg?.text || "(empty message)"}</pre>
+            }
+          </div>
+        </div>
+      );
+    }
+
+    /* ========= App ========= */
+    function App() {
+      const [session, setSess]     = useState(null);
+      const [messages, setMsgs]    = useState([]);
+      const [selId, setSelId]      = useState(null);
+      const [gen, setGen]          = useState(false);
+      const [probing, setProbing]  = useState(false);
+      const [refreshing, setRef]   = useState(false);
+      const [toast, setToast]      = useState(null);
+      const [copied, setCopied]    = useState(false);
+      const [error, setError]      = useState(null);
+      const [autoR, setAutoR]      = useState(true);
+      const [lastR, setLastR]      = useState(null);
+      const [, bump]               = useState(0);
+      const intv = useRef(null);
+      const isMobile = window.innerWidth < 700;
+
+      useEffect(() => {
+        const s = loadSession();
+        if (s?.token) { setSess(s); fetchMsgs(s.token); }
+      }, []);
+
+      useEffect(() => {
+        clearInterval(intv.current);
+        if (autoR && session?.token) intv.current = setInterval(() => fetchMsgs(session.token, true), 15000);
+        return () => clearInterval(intv.current);
+      }, [autoR, session]);
+
+      const fetchMsgs = useCallback(async (token, silent = false) => {
+        if (!silent) setRef(true);
+        try {
+          setMsgs(await api.getMessages(token));
+          setLastR(new Date()); setError(null);
+        } catch (e) {
+          if (!silent) setError(e.message);
+        } finally {
+          if (!silent) setRef(false);
+        }
+      }, []);
+
+      const generate = async () => {
+        setGen(true); setError(null); _si = null; setProbing(true);
+        try {
+          const domains = await api.getDomains();
+          setProbing(false); bump(n => n + 1);
+          if (!domains?.length) throw new Error("No domains returned — try again shortly");
+          const address  = `${rand(8)}@${domains[0].domain}`;
+          const password = rand(14);
+          await api.createAccount(address, password);
+          const { token } = await api.getToken(address, password);
+          const s = { email: address, password, token };
+          saveSession(s); setSess(s); setMsgs([]); setSelId(null);
+          setToast("✨ New inbox created!"); fetchMsgs(token);
+        } catch (e) {
+          _si = null; setProbing(false);
+          setError(e.message || "Failed — please try again");
+        } finally { setGen(false); }
+      };
+
+      const copy = () => {
+        if (!session?.email) return;
+        navigator.clipboard.writeText(session.email).then(() => {
+          setCopied(true); setToast("Copied!");
+          setTimeout(() => setCopied(false), 2000);
+        });
+      };
+
+      const nukeInbox = () => {
+        if (!window.confirm("Delete this inbox permanently?")) return;
+        clearSession(); setSess(null); setMsgs([]); setSelId(null); setToast("Inbox deleted.");
+      };
+
+      const selectMsg = (id) => {
+        setSelId(id); setMsgs(prev => prev.map(m => m.id === id ? { ...m, seen: true } : m));
+      };
+
+      const delMsg = () => {
+        setMsgs(prev => prev.filter(m => m.id !== selId)); setSelId(null); setToast("Message deleted.");
+      };
+
+      const unread = messages.filter(m => !m.seen).length;
+      const showSidebar = !selId || !isMobile;
+
+      const stratLabel = () => {
+        if (_si === null) return null;
+        const labels = ["mail.tm direct","mail.gw direct","mail.tm via proxy","mail.gw via proxy","mail.tm via allorigins","mail.gw via allorigins"];
+        const isProxy = _si >= 2;
+        return <span style={{ fontSize: 10, color: isProxy ? "#e2b87a" : "#2d4a3e", marginLeft: 6 }}>({labels[_si] || `strategy ${_si}`})</span>;
+      };
+
+      const btn = (v = "d") => ({
+        display: "inline-flex", alignItems: "center", gap: 6,
+        padding: v === "p" ? "12px 28px" : "7px 13px",
+        fontSize: v === "p" ? 14 : 13, fontWeight: 700, fontFamily: "inherit",
+        cursor: "pointer", borderRadius: v === "p" ? 12 : 9, transition: "all 0.15s", whiteSpace: "nowrap",
+        border: v === "g" ? "1px solid rgba(255,255,255,0.1)" : v === "a" ? "1px solid rgba(99,211,168,0.25)" : "none",
+        background: v === "p" ? "#63d3a8" : v === "del" ? "rgba(226,122,122,0.1)" : v === "a" ? "rgba(99,211,168,0.12)" : "rgba(255,255,255,0.06)",
+        color: v === "p" ? "#0d1a14" : v === "del" ? "#e27a7a" : v === "a" ? "#63d3a8" : "#8fada3",
+      });
+
+      return (
+        <div style={{ minHeight: "100vh", background: "#0d1a14", color: "#c8e6da", fontFamily: "'DM Sans','Segoe UI',sans-serif", display: "flex", flexDirection: "column" }}>
+
+          <header style={{ background: "rgba(13,26,20,0.97)", backdropFilter: "blur(20px)", borderBottom: "1px solid rgba(99,211,168,0.1)", padding: "13px 20px", display: "flex", alignItems: "center", gap: 12, position: "sticky", top: 0, zIndex: 100 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: "'Space Grotesk',sans-serif", fontWeight: 800, fontSize: 18, color: "#63d3a8", letterSpacing: "-0.03em" }}>
+              <div style={{ background: "linear-gradient(135deg,#63d3a8,#2d9e72)", borderRadius: 7, padding: "4px 6px", display: "flex" }}>
+                <Icon name="zap" size={15} style={{ color: "#0d1a14" }} />
+              </div>
+              TempVault
+            </div>
+            <div style={{ flex: 1 }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: "#2d4a3e" }}>
+              <Icon name="shield" size={12} style={{ color: "#63d3a8" }} /> 100% free · no signup
+            </div>
+          </header>
+
+          <div style={{ flex: 1, maxWidth: 1100, width: "100%", margin: "0 auto", padding: "0 16px", display: "flex", flexDirection: "column" }}>
+
+            {!session ? (
+              /* ── LANDING ── */
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 20px", animation: "fadeIn 0.4s ease" }}>
+                <div style={{ fontSize: 11, letterSpacing: "0.15em", color: "#63d3a8", textTransform: "uppercase", marginBottom: 14, fontWeight: 600 }}>Disposable · Anonymous · Instant</div>
+                <h1 style={{ fontSize: "clamp(30px,6vw,52px)", fontFamily: "'Space Grotesk',sans-serif", fontWeight: 800, color: "#e2f0eb", lineHeight: 1.1, marginBottom: 14, textAlign: "center" }}>
+                  Temp Email.<br /><span style={{ color: "#63d3a8" }}>Zero traces.</span>
+                </h1>
+                <p style={{ color: "#3a5a50", fontSize: 15, maxWidth: 400, margin: "0 auto 36px", textAlign: "center", lineHeight: 1.6 }}>
+                  Generate a throwaway inbox in seconds. No signup, no tracking, no server.
+                </p>
+
+                <button className="btn-hover" style={btn("p")} onClick={generate} disabled={gen}>
+                  {gen ? <><Spinner size={15} />{probing ? "Finding working API…" : "Creating inbox…"}</> : <><Icon name="plus" size={16} style={{ color: "#0d1a14" }} />Generate Inbox</>}
+                </button>
+
+                {probing && (
+                  <div style={{ marginTop: 14, fontSize: 12, color: "#3a5a50", display: "flex", alignItems: "center", gap: 6 }}>
+                    <Spinner size={12} /> Trying API endpoints…
+                  </div>
+                )}
+
+                {error && (
+                  <div style={{ marginTop: 20, color: "#e27a7a", fontSize: 13, background: "rgba(226,122,122,0.07)", border: "1px solid rgba(226,122,122,0.15)", padding: "14px 18px", borderRadius: 12, maxWidth: 420, textAlign: "center", lineHeight: 1.6 }}>
+                    {error}
+                    <div style={{ marginTop: 8, fontSize: 11, color: "#8a5050" }}>Confirm you have internet access, then tap Generate again.</div>
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center", marginTop: 52 }}>
+                  {[["zap","Instant","Ready in seconds"],["shield","Private","No data retained"],["trash","Disposable","Delete anytime"],["star","Free","Always & forever"]].map(([icon,label,desc]) => (
+                    <div key={label} style={{ background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: "12px 16px", display: "flex", gap: 10, alignItems: "center" }}>
+                      <div style={{ background: "rgba(99,211,168,0.1)", borderRadius: 7, padding: 7, display: "flex" }}>
+                        <Icon name={icon} size={14} style={{ color: "#63d3a8" }} />
+                      </div>
+                      <div>
+                        <div style={{ fontWeight: 700, fontSize: 13, color: "#c8e6da" }}>{label}</div>
+                        <div style={{ fontSize: 11, color: "#2d4a3e" }}>{desc}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+            ) : (
+              /* ── INBOX ── */
+              <>
+                <div style={{ padding: "20px 0 16px", animation: "fadeIn 0.3s ease" }}>
+                  <div style={{ fontSize: 11, color: "#2d4a3e", marginBottom: 6, letterSpacing: "0.08em", textTransform: "uppercase", display: "flex", alignItems: "center", gap: 4 }}>
+                    <Icon name="eye" size={10} style={{ color: "#2d4a3e" }} />Your temporary address{stratLabel()}
+                  </div>
+                  <div onClick={copy} style={{ display: "flex", alignItems: "center", gap: 10, background: "rgba(99,211,168,0.06)", border: "1px solid rgba(99,211,168,0.18)", borderRadius: 11, padding: "10px 15px", cursor: "pointer", marginBottom: 12, transition: "background 0.15s" }}
+                    onMouseEnter={e => e.currentTarget.style.background = "rgba(99,211,168,0.1)"}
+                    onMouseLeave={e => e.currentTarget.style.background = "rgba(99,211,168,0.06)"}>
+                    <Icon name="mail" size={14} style={{ color: "#63d3a8", flexShrink: 0 }} />
+                    <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 14, color: "#e2f0eb", flex: 1, wordBreak: "break-all" }}>{session.email}</span>
+                    <span style={{ color: copied ? "#63d3a8" : "#3a5a50", display: "flex", alignItems: "center", gap: 4, fontSize: 12, flexShrink: 0 }}>
+                      <Icon name={copied ? "check" : "copy"} size={13} style={{ color: copied ? "#63d3a8" : "#3a5a50" }} />
+                      {copied ? "Copied!" : "Copy"}
+                    </span>
+                  </div>
+
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <button className="btn-hover" style={btn("g")} onClick={() => fetchMsgs(session.token)} disabled={refreshing}>
+                      {refreshing ? <Spinner size={13} /> : <Icon name="refresh" size={13} style={{ color: "#8fada3" }} />}
+                      {refreshing ? "Refreshing…" : "Refresh"}
+                    </button>
+                    <button className="btn-hover" style={autoR ? btn("a") : btn("g")} onClick={() => setAutoR(a => !a)}>
+                      <div style={{ width: 7, height: 7, borderRadius: "50%", background: autoR ? "#63d3a8" : "#3a5a50", animation: autoR ? "pulse 1.5s infinite" : "none" }} />
+                      Auto {autoR ? "on" : "off"}
+                    </button>
+                    <button className="btn-hover" style={btn("g")} onClick={generate} disabled={gen}>
+                      {gen ? <Spinner size={13} /> : <Icon name="plus" size={13} style={{ color: "#8fada3" }} />}
+                      New Inbox
+                    </button>
+                    <button className="btn-hover" style={{ ...btn("del"), marginLeft: "auto" }} onClick={nukeInbox}>
+                      <Icon name="trash" size={13} style={{ color: "#e27a7a" }} />
+                    </button>
+                    {lastR && <span style={{ fontSize: 11, color: "#2d4a3e" }}>Updated {fmtDate(lastR.toISOString())}</span>}
+                  </div>
+                  {error && <div style={{ marginTop: 10, color: "#e27a7a", fontSize: 12, background: "rgba(226,122,122,0.08)", padding: "8px 14px", borderRadius: 8 }}>{error}</div>}
+                </div>
+
+                <div style={{ background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 14, overflow: "hidden", display: "flex", marginBottom: 28, height: "clamp(420px,60vh,680px)" }}>
+                  {showSidebar && (
+                    <div style={{ width: isMobile ? "100%" : "clamp(220px,34%,300px)", borderRight: isMobile ? "none" : "1px solid rgba(255,255,255,0.05)", display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden" }}>
+                      <div style={{ padding: "13px 16px", borderBottom: "1px solid rgba(255,255,255,0.05)", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                        <Icon name="inbox" size={14} style={{ color: "#63d3a8" }} />
+                        <span style={{ fontWeight: 700, fontSize: 13, color: "#c8e6da" }}>Inbox</span>
+                        {unread > 0 && <span style={{ background: "#63d3a8", color: "#0d1a14", borderRadius: 20, fontSize: 11, fontWeight: 800, padding: "1px 8px" }}>{unread}</span>}
+                      </div>
+                      <div style={{ flex: 1, overflowY: "auto" }}>
+                        {refreshing && messages.length === 0
+                          ? <div style={{ display: "flex", justifyContent: "center", padding: 36 }}><Spinner size={24} /></div>
+                          : messages.length === 0
+                            ? <div style={{ padding: 44, textAlign: "center" }}>
+                                <div style={{ fontSize: 38, marginBottom: 12 }}>📭</div>
+                                <div style={{ color: "#2d4a3e", fontSize: 13, fontWeight: 600, marginBottom: 4 }}>No messages yet</div>
+                                <div style={{ color: "#1e3328", fontSize: 12, lineHeight: 1.5 }}>Send an email to your temp address and it'll appear here</div>
+                              </div>
+                            : messages.map(m => <MessageRow key={m.id} msg={m} selected={selId === m.id} onClick={() => selectMsg(m.id)} />)
+                        }
+                      </div>
+                    </div>
+                  )}
+
+                  {(!isMobile || selId) && (
+                    <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", minWidth: 0 }}>
+                      {selId
+                        ? <MessageView token={session.token} msgId={selId} onBack={() => setSelId(null)} onDelete={delMsg} />
+                        : <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 10 }}>
+                            <div style={{ fontSize: 44 }}>✉️</div>
+                            <div style={{ color: "#2d4a3e", fontSize: 14, fontWeight: 600 }}>Select a message to read</div>
+                            <div style={{ color: "#1e3328", fontSize: 12 }}>Auto-refreshes every 15 seconds</div>
+                          </div>
+                      }
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
+          <div style={{ textAlign: "center", padding: "14px", color: "#1a2e24", fontSize: 11, borderTop: "1px solid rgba(255,255,255,0.04)" }}>
+            TempVault · Mail.tm API · No data stored on any server
+          </div>
+
+          {toast && <Toast msg={toast} onDone={() => setToast(null)} />}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
