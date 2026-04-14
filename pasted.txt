@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TempVault</title>
+</head>
+<body>
+    <h1>Welcome to TempVault</h1>
+    <p>Your disposable email address is generated immediately for temporary use.</p>
+    <p>Feel free to use it for registration on websites that require email verification.</p>
+</body>
+</html>
